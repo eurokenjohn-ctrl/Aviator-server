@@ -446,10 +446,21 @@ async function getNextCrashPoint() {
      }
    } catch(e) {}
    
-   const e = 100;
-   const h_rand = Math.random() * 95;
-   let cp = Math.max(1.00, Math.floor(100 * e - e) / (e - h_rand));
-   if (cp > 1500) cp = 1500;
+   const rand = Math.random();
+   let cp;
+   if (rand < 0.5) {
+      // 50% chance: 1.00 - 5.00 (Common)
+      cp = 1.00 + Math.random() * 4.00;
+   } else if (rand < 0.8) {
+      // 30% chance: 5.00 - 50.00 (Professional range)
+      cp = 5.00 + Math.random() * 45.00;
+   } else if (rand < 0.95) {
+      // 15% chance: 50.00 - 100.00 (Exciting range)
+      cp = 50.00 + Math.random() * 50.00;
+   } else {
+      // 5% chance: 100.00 - 150.00 (Jackpot range)
+      cp = 100.00 + Math.random() * 50.00;
+   }
    return parseFloat(cp.toFixed(2));
 }
 
