@@ -246,6 +246,44 @@ app.post('/cashout', async (req, res) => {
   }
 });
 
+app.post('/withdraw', async (req, res) => {
+  const { phone, amount } = req.body;
+  const formattedPhone = formatPhone(phone);
+  
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+  if (!amount || amount < 100) return res.status(400).json({ error: 'Minimum withdrawal is KSH 100' });
+
+  try {
+    const user = await pool.query('SELECT balance FROM users WHERE phone = $1', [formattedPhone]);
+    if (user.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    let currentBalance = parseFloat(user.rows[0].balance);
+    let withdrawAmount = parseFloat(amount);
+
+    if (currentBalance < withdrawAmount) return res.status(400).json({ error: 'Insufficient balance' });
+
+    await pool.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [withdrawAmount, formattedPhone]);
+    
+    // Save withdrawal in transactions table
+    await pool.query(
+      "INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, 'withdrawal', 'success')",
+      [formattedPhone, withdrawAmount]
+    );
+
+    // Send notification
+    await pool.query(
+      "INSERT INTO notifications (phone, message) VALUES ($1, $2)",
+      [formattedPhone, `Withdrawal of KSH ${withdrawAmount.toFixed(2)} was successful.`]
+    );
+
+    const updatedUser = await pool.query('SELECT balance FROM users WHERE phone = $1', [formattedPhone]);
+    res.json({ success: true, balance: parseFloat(updatedUser.rows[0].balance) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error during withdrawal' });
+  }
+});
+
 /* =========================
    ADMIN DASHBOARD
 ========================= */
