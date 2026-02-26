@@ -1,0 +1,657 @@
+require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const PDFDocument = require("pdfkit");
+const { Pool } = require("pg");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+/* =========================
+   DATABASE CONNECTION
+========================= */
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+pool.connect()
+  .then(() => console.log("✅ Connected to Railway PostgreSQL"))
+  .catch(err => console.error("❌ DB Connection error", err.stack));
+
+/* =========================
+   RECEIPTS (JSON - OPTION A)
+========================= */
+
+const receiptsFile = path.join(__dirname, "receipts.json");
+
+function readReceipts() {
+  if (!fs.existsSync(receiptsFile)) return {};
+  return JSON.parse(fs.readFileSync(receiptsFile));
+}
+
+function writeReceipts(data) {
+  fs.writeFileSync(receiptsFile, JSON.stringify(data, null, 2));
+}
+
+function formatPhone(phone) {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length === 9 && digits.startsWith("7")) return "254" + digits;
+  if (digits.length === 10 && digits.startsWith("07"))
+    return "254" + digits.substring(1);
+  if (digits.length === 12 && digits.startsWith("254")) return digits;
+  return null;
+}
+
+/* =========================
+   AUTH ROUTES
+========================= */
+
+app.get('/', (req, res) => {
+  res.send('Unified Server Running');
+});
+
+app.post('/signup', async (req, res) => {
+  const { username, phone, pin, referralCode } = req.body;
+
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) {
+    return res.status(400).json({ error: "Invalid phone format" });
+  }
+  try {
+    const checkUser = await pool.query(
+      'SELECT * FROM users WHERE phone = $1 OR username = $2',
+      [formattedPhone, username]
+    );
+
+    if (checkUser.rows.length > 0) {
+      return res.status(400).json({ error: 'Username or Phone number already in use' });
+    }
+
+    await pool.query(
+      'INSERT INTO users (username, phone, pin, balance, referral_code) VALUES ($1, $2, $3, 0, $4)',
+      [username, formattedPhone, pin, referralCode || null]
+    );
+
+    res.json({ success: true, message: 'Signup successful' });
+
+  } catch (err) {
+    res.status(500).json({ error: 'Server error during signup' });
+  }
+});
+
+app.post('/login', async (req, res) => {
+  const { phone, pin } = req.body;
+   const formattedPhone = formatPhone(phone);
+  try {
+    const user = await pool.query(
+      'SELECT username, phone, balance FROM users WHERE phone = $1 AND pin = $2',
+      [formattedPhone, pin]
+    );
+
+    if (user.rows.length > 0) {
+      res.json({ success: true, user: user.rows[0] });
+    } else {
+      res.status(401).json({ error: 'Invalid phone or PIN' });
+    }
+
+  } catch (err) {
+    res.status(500).json({ error: 'Server error during login' });
+  }
+});
+
+app.post('/refresh-balance', async (req, res) => {
+  const { phone } = req.body;
+  const formattedPhone = formatPhone(phone);
+  try {
+    const user = await pool.query(
+      'SELECT balance FROM users WHERE phone = $1',
+      [formattedPhone]
+    );
+
+    if (user.rows.length > 0) {
+      res.json({ success: true, balance: user.rows[0].balance });
+    } else {
+      res.status(404).json({ error: 'User not found' });
+    }
+
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching balance' });
+  }
+});
+
+/* =========================
+   BETTING & CASH OUT
+========================= */
+
+app.post('/bet', async (req, res) => {
+  const { phone, amount } = req.body;
+
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone)
+    return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const user = await pool.query(
+      'SELECT balance FROM users WHERE phone = $1',
+      [formattedPhone]
+    );
+
+    if (user.rows.length === 0)
+      return res.status(404).json({ error: 'User not found' });
+
+    let currentBalance = parseFloat(user.rows[0].balance);
+    let betAmount = parseFloat(amount);
+
+    if (currentBalance < betAmount)
+      return res.status(400).json({ error: 'Insufficient balance' });
+
+    await pool.query(
+      'UPDATE users SET balance = balance - $1 WHERE phone = $2',
+      [betAmount, formattedPhone]
+    );
+
+    const insertResult = await pool.query(
+      'INSERT INTO bets (phone, amount, status) VALUES ($1, $2, $3) RETURNING id',
+      [formattedPhone, betAmount, 'placed']
+    );
+
+    await pool.query(
+      'INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)',
+      [formattedPhone, betAmount, 'bet', 'success']
+    );
+
+    res.json({ success: true, balance: currentBalance - betAmount, betId: insertResult.rows[0].id });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error placing bet' });
+  }
+});
+
+app.post('/cancel_bet', async (req, res) => {
+  const { phone, betId } = req.body;
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const betResult = await pool.query("SELECT * FROM bets WHERE id = $1 AND phone = $2 AND status = 'placed'", [betId, formattedPhone]);
+    if (betResult.rows.length === 0) return res.status(400).json({ error: 'Bet not found or already processed' });
+    
+    let betAmount = parseFloat(betResult.rows[0].amount);
+
+    await pool.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [betAmount, formattedPhone]);
+    await pool.query("UPDATE bets SET status = 'cancelled' WHERE id = $1", [betId]);
+    await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)", [formattedPhone, betAmount, 'cancel_bet', 'success']);
+    
+    const user = await pool.query('SELECT balance FROM users WHERE phone = $1', [formattedPhone]);
+    res.json({ success: true, balance: parseFloat(user.rows[0].balance) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error cancelling bet' });
+  }
+});
+
+app.post('/cashout', async (req, res) => {
+  const { phone, amount, multiplier, betId } = req.body;
+
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone)
+    return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    let winAmount = parseFloat(amount);
+    let mult = parseFloat(multiplier);
+
+    // If betId is provided, update the specific bet, otherwise update the latest placed bet for safety
+    if (betId) {
+      const betCheck = await pool.query("SELECT * FROM bets WHERE id = $1 AND phone = $2 AND status = 'placed'", [betId, formattedPhone]);
+      if (betCheck.rows.length === 0) return res.status(400).json({ error: 'Bet already cashed out or invalid' });
+      
+      await pool.query("UPDATE bets SET multiplier = $1, status = 'cashed_out' WHERE id = $2", [mult, betId]);
+    } else {
+      await pool.query(
+        "UPDATE bets SET multiplier = $1, status = 'cashed_out' WHERE phone = $2 AND status = 'placed' AND id = (SELECT id FROM bets WHERE phone = $2 AND status = 'placed' ORDER BY id DESC LIMIT 1)",
+        [mult, formattedPhone]
+      );
+    }
+
+    await pool.query(
+      'UPDATE users SET balance = balance + $1 WHERE phone = $2',
+      [winAmount, formattedPhone]
+    );
+
+    await pool.query(
+      'INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)',
+      [formattedPhone, winAmount, 'win', 'success']
+    );
+
+    const user = await pool.query(
+      'SELECT balance FROM users WHERE phone = $1',
+      [formattedPhone]
+    );
+
+    res.json({ success: true, balance: parseFloat(user.rows[0].balance) });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error cashing out' });
+  }
+});
+
+/* =========================
+   ADMIN DASHBOARD
+========================= */
+
+app.get('/admin/stats', async (req, res) => {
+  const password = req.headers['authorization'];
+  if (password !== '3462Abel@#') {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
+    const totalBalance = await pool.query('SELECT SUM(balance) FROM users');
+    const totalBets = await pool.query('SELECT COUNT(*) FROM bets');
+    
+    res.json({ 
+      success: true, 
+      users: parseInt(totalUsers.rows[0].count),
+      balance: parseFloat(totalBalance.rows[0].sum || 0),
+      bets: parseInt(totalBets.rows[0].count)
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching stats' });
+  }
+});
+
+
+/* =========================
+   ADMIN ADDITIONAL ROUTES
+========================= */
+app.post('/admin/set-odds', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  try {
+    await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('next_multiplier', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [req.body.multiplier]);
+    res.json({success: true});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.get('/api/next-odd', async (req, res) => {
+  try {
+    const s = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'next_multiplier'");
+    let mult = null;
+    if(s.rows.length > 0 && s.rows[0].setting_value) {
+      mult = parseFloat(s.rows[0].setting_value);
+      await pool.query("UPDATE settings SET setting_value = '' WHERE setting_key = 'next_multiplier'");
+      res.json({success: true, multiplier: mult});
+    } else {
+      res.json({success: true, multiplier: null});
+    }
+  } catch(e) { res.json({success: false}); }
+});
+
+app.get('/admin/users', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  try {
+    const users = await pool.query("SELECT id, username, phone, pin, balance, status FROM users ORDER BY id DESC");
+    res.json({success: true, users: users.rows});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.post('/admin/users/action', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  const { action, userId, amount } = req.body;
+  try {
+    if(action === 'delete') await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+    else if(action === 'suspend') await pool.query("UPDATE users SET status = 'suspended' WHERE id = $1", [userId]);
+    else if(action === 'activate') await pool.query("UPDATE users SET status = 'active' WHERE id = $1", [userId]);
+    else if(action === 'adjust') {
+      await pool.query("UPDATE users SET balance = balance + $1 WHERE id = $2", [amount, userId]);
+      const u = await pool.query("SELECT phone FROM users WHERE id = $1", [userId]);
+      if(u.rows.length > 0) {
+        await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)", [u.rows[0].phone, amount, 'admin_adjustment', 'success']);
+      }
+    }
+    res.json({success: true});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.get('/admin/transactions', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  try {
+    const tx = await pool.query("SELECT * FROM transactions ORDER BY created_at DESC LIMIT 100");
+    res.json({success: true, transactions: tx.rows});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.post('/admin/send-notification', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  const { target, phone, message } = req.body;
+  try {
+    let count = 0;
+    if(target === 'all') {
+      const users = await pool.query("SELECT phone FROM users WHERE status = 'active'");
+      for(const u of users.rows) {
+        await pool.query("INSERT INTO notifications (phone, message) VALUES ($1, $2)", [u.phone, message]);
+        count++;
+      }
+    } else if(target === 'specific' && phone) {
+      await pool.query("INSERT INTO notifications (phone, message) VALUES ($1, $2)", [phone, message]);
+      count = 1;
+    }
+    res.json({success: true, count});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.get('/api/notifications', async (req, res) => {
+  const { phone } = req.query;
+
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone)
+    return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const notifs = await pool.query(
+      "SELECT * FROM notifications WHERE phone = $1 ORDER BY created_at DESC LIMIT 50",
+      [formattedPhone]
+    );
+
+    res.json({ success: true, notifications: notifs.rows });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/notifications/mark-read', async (req, res) => {
+  const { phone } = req.body;
+
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone)
+    return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    await pool.query(
+      "UPDATE notifications SET is_read = true WHERE phone = $1",
+      [formattedPhone]
+    );
+
+    res.json({ success: true });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================
+   GAME ENGINE & SSE
+========================= */
+
+let clients = [];
+let gameStatus = 'WAITING';
+let currentMultiplier = 1.00;
+let currentCrashPoint = 1.00;
+let oddsHistory = [];
+
+app.get('/api/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  
+  // Send initial state
+  res.write(`data: ${JSON.stringify({ status: gameStatus, multiplier: currentMultiplier, history: oddsHistory })}\n\n`);
+  
+  clients.push(res);
+  req.on('close', () => {
+    clients = clients.filter(c => c !== res);
+  });
+});
+
+function broadcast(data) {
+  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  clients.forEach(c => c.write(msg));
+}
+
+async function getNextCrashPoint() {
+   try {
+     const s = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'next_multiplier'");
+     if(s.rows.length > 0 && s.rows[0].setting_value) {
+       let mult = parseFloat(s.rows[0].setting_value);
+       await pool.query("UPDATE settings SET setting_value = '' WHERE setting_key = 'next_multiplier'");
+       return mult;
+     }
+   } catch(e) {}
+   
+   try {
+     const listQuery = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'odds_list'");
+     if(listQuery.rows.length > 0 && listQuery.rows[0].setting_value) {
+        let list = listQuery.rows[0].setting_value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+        if(list.length > 0) {
+           return list[Math.floor(Math.random() * list.length)];
+        }
+     }
+   } catch(e) {}
+   
+   const e = 100;
+   const h_rand = Math.random() * 95;
+   let cp = Math.max(1.00, Math.floor(100 * e - e) / (e - h_rand));
+   if (cp > 1500) cp = 1500;
+   return parseFloat(cp.toFixed(2));
+}
+
+async function runGameLoop() {
+   gameStatus = 'WAITING';
+   currentMultiplier = 1.00;
+   broadcast({ status: 'WAITING', time: 6, history: oddsHistory });
+   
+   let waitTime = 6;
+   let waitInt = setInterval(() => {
+      waitTime--;
+      broadcast({ status: 'WAITING', time: waitTime, history: oddsHistory });
+      if(waitTime <= 0) clearInterval(waitInt);
+   }, 1000);
+   
+   await new Promise(r => setTimeout(r, 6000));
+   
+   gameStatus = 'RUNNING';
+   currentCrashPoint = await getNextCrashPoint();
+   
+   let gameInterval = setInterval(() => {
+      let increment = currentMultiplier < 2 ? 0.01 : currentMultiplier < 5 ? 0.05 : 0.1;
+      currentMultiplier += increment;
+      
+      if (currentMultiplier >= currentCrashPoint) {
+         clearInterval(gameInterval);
+         currentMultiplier = currentCrashPoint;
+         gameStatus = 'CRASHED';
+         oddsHistory.unshift(currentCrashPoint.toFixed(2));
+         if(oddsHistory.length > 15) oddsHistory.pop();
+         
+         broadcast({ status: 'CRASHED', multiplier: currentMultiplier, history: oddsHistory });
+         
+         setTimeout(() => {
+            runGameLoop();
+         }, 3000);
+      } else {
+         broadcast({ status: 'RUNNING', multiplier: currentMultiplier });
+      }
+   }, 50);
+}
+
+// Start game engine only after DB connects
+pool.connect().then(() => runGameLoop()).catch(err => console.log(err));
+
+/* =========================
+   STK PAYMENT ROUTES
+========================= */
+
+app.post("/pay", async (req, res) => {
+  try {
+    const { phone, amount } = req.body;
+    const formattedPhone = formatPhone(phone);
+
+    if (!formattedPhone)
+      return res.status(400).json({ success: false, error: "Invalid phone format" });
+
+    if (!amount || amount < 1)
+      return res.status(400).json({ success: false, error: "Amount must be >= 1" });
+
+    const reference = "ORDER-" + Date.now();
+
+    const payload = {
+      amount: Math.round(amount),
+      phone_number: formattedPhone,
+      external_reference: reference,
+      customer_name: "Customer",
+      callback_url: process.env.BASE_URL + "/callback",
+      channel_id: "000603"
+    };
+
+    const resp = await axios.post(
+      "https://swiftwallet.co.ke/v3/stk-initiate/",
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.SWIFTWALLET_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    if (resp.data.success) {
+      const receiptData = {
+        reference,
+        amount: Math.round(amount),
+        phone: formattedPhone,
+        status: "pending",
+        timestamp: new Date().toISOString()
+      };
+
+      let receipts = readReceipts();
+      receipts[reference] = receiptData;
+      writeReceipts(receipts);
+
+      res.json({ success: true, reference });
+
+    } else {
+      res.status(400).json({
+        success: false,
+        error: resp.data.error || "Failed to initiate payment"
+      });
+    }
+
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message || "Server error"
+    });
+  }
+});
+
+app.post("/callback", async (req, res) => {
+  const data = req.body;
+  const ref = data.external_reference;
+
+  let receipts = readReceipts();
+  const existingReceipt = receipts[ref] || {};
+  const resultCode = data.result?.ResultCode;
+
+  if (resultCode === 0) {
+
+    receipts[ref] = {
+      ...existingReceipt,
+      status: "success",
+      transaction_code: data.result?.MpesaReceiptNumber || null,
+      amount: data.result?.Amount || existingReceipt.amount,
+      phone: data.result?.Phone || existingReceipt.phone,
+      timestamp: new Date().toISOString()
+    };
+
+    writeReceipts(receipts);
+
+    // ✅ DIRECT DATABASE UPDATE (NO HTTP CALL)
+    try {
+      await pool.query(
+        'UPDATE users SET balance = balance + $1 WHERE phone = $2',
+        [receipts[ref].amount, receipts[ref].phone]
+      );
+      await pool.query('INSERT INTO transactions (phone, amount, type, reference, status) VALUES ($1, $2, $3, $4, $5)', 
+        [receipts[ref].phone, receipts[ref].amount, 'deposit', ref, 'success']);
+      await pool.query('INSERT INTO notifications (phone, message) VALUES ($1, $2)',
+        [receipts[ref].phone, `Your deposit of KSH ${receipts[ref].amount} was successful.`]);
+      console.log("✅ Balance updated in PostgreSQL");
+    } catch (err) {
+      console.error("❌ DB update failed:", err.message);
+    }
+
+  } else {
+    receipts[ref] = {
+      ...existingReceipt,
+      status: "failed",
+      timestamp: new Date().toISOString()
+    };
+    writeReceipts(receipts);
+  }
+
+  res.json({ ResultCode: 0, ResultDesc: "Callback received" });
+});
+
+/* =========================
+   RECEIPT ROUTES
+========================= */
+
+app.get("/receipt/:reference", (req, res) => {
+  const { reference } = req.params;
+  const receipts = readReceipts();
+  const receipt = receipts[reference];
+
+  if (!receipt) {
+    return res.status(404).json({ success: false, error: "Receipt not found" });
+  }
+
+  res.json({ success: true, receipt });
+});
+
+app.get("/receipt/:reference/pdf", (req, res) => {
+  const { reference } = req.params;
+  const receipts = readReceipts();
+  const receipt = receipts[reference];
+
+  if (!receipt) {
+    return res.status(404).json({ error: "Receipt not found" });
+  }
+
+  const doc = new PDFDocument();
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename=${reference}.pdf`);
+  doc.pipe(res);
+
+  doc.fontSize(18).text("Payment Receipt", { align: "center" });
+  doc.moveDown();
+  doc.text(`Reference: ${receipt.reference}`);
+  doc.text(`Phone: ${receipt.phone}`);
+  doc.text(`Amount: KES ${receipt.amount}`);
+  doc.text(`Status: ${receipt.status}`);
+  doc.text(`Transaction Code: ${receipt.transaction_code || "N/A"}`);
+  doc.text(`Date: ${receipt.timestamp}`);
+
+  doc.end();
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Unified Server running on port ${PORT}`);
+});
