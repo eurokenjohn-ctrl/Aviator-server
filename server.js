@@ -107,6 +107,68 @@ app.post('/login', async (req, res) => {
   }
 });
 
+app.post('/change-pin', async (req, res) => {
+  const { phone, oldPin, newPin } = req.body;
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+  
+  if (!newPin || newPin.length !== 6) return res.status(400).json({ error: 'New PIN must be 6 characters' });
+
+  try {
+    const user = await pool.query(
+      'SELECT * FROM users WHERE phone = $1 AND pin = $2',
+      [formattedPhone, oldPin]
+    );
+
+    if (user.rows.length > 0) {
+      await pool.query('UPDATE users SET pin = $1 WHERE phone = $2', [newPin, formattedPhone]);
+      res.json({ success: true, message: 'PIN changed successfully' });
+    } else {
+      res.status(401).json({ error: 'Invalid old PIN' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: 'Server error during PIN change' });
+  }
+});
+
+app.post('/transactions-history', async (req, res) => {
+  const { phone } = req.body;
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const tx = await pool.query(
+      "SELECT amount, type, status, created_at FROM transactions WHERE phone = $1 AND type IN ('withdrawal', 'deposit') ORDER BY created_at DESC",
+      [formattedPhone]
+    );
+    res.json({ success: true, transactions: tx.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching transactions' });
+  }
+});
+
+app.post('/delete-account', async (req, res) => {
+  const { phone, pin } = req.body;
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const user = await pool.query(
+      'SELECT * FROM users WHERE phone = $1 AND pin = $2',
+      [formattedPhone, pin]
+    );
+
+    if (user.rows.length > 0) {
+      await pool.query('DELETE FROM users WHERE phone = $1', [formattedPhone]);
+      res.json({ success: true, message: 'Account deleted successfully' });
+    } else {
+      res.status(401).json({ error: 'Invalid PIN' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: 'Server error during account deletion' });
+  }
+});
+
 app.post('/refresh-balance', async (req, res) => {
   const { phone } = req.body;
   const formattedPhone = formatPhone(phone);
