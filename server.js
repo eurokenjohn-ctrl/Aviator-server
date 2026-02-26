@@ -427,6 +427,28 @@ app.post('/admin/users/action', async (req, res) => {
   } catch(e) { res.status(500).json({error: e.message}); }
 });
 
+app.post('/admin/users/adjust-by-phone', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  const { phone, amount } = req.body;
+  
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+  if (isNaN(amount)) return res.status(400).json({ error: 'Invalid amount' });
+
+  try {
+    const user = await pool.query("SELECT id FROM users WHERE phone = $1", [formattedPhone]);
+    if(user.rows.length === 0) return res.status(404).json({error: 'User not found'});
+    
+    await pool.query("UPDATE users SET balance = balance + $1 WHERE phone = $2", [amount, formattedPhone]);
+    await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)", [formattedPhone, amount, 'admin_adjustment', 'success']);
+    
+    res.json({success: true});
+  } catch(e) { 
+    res.status(500).json({error: e.message}); 
+  }
+});
+
 app.get('/admin/transactions', async (req, res) => {
   const pwd = req.headers['authorization'];
   if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
