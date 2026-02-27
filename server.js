@@ -213,7 +213,7 @@ app.post('/refresh-balance', async (req, res) => {
 ========================= */
 
 app.post('/bet', async (req, res) => {
-  const { phone, amount } = req.body;
+  const { phone, amount, autoCashout } = req.body;
 
   const formattedPhone = formatPhone(phone);
   if (!formattedPhone)
@@ -249,7 +249,16 @@ app.post('/bet', async (req, res) => {
       [formattedPhone, betAmount, 'bet', 'success']
     );
 
-    res.json({ success: true, balance: currentBalance - betAmount, betId: insertResult.rows[0].id });
+    const betId = insertResult.rows[0].id;
+    const betObj = { id: betId, phone: formattedPhone, amount: betAmount, autoCashout: autoCashout ? parseFloat(autoCashout) : null, cashedOut: false };
+    
+    if (gameStatus === 'WAITING') {
+      activeBets.push(betObj);
+    } else {
+      pendingBets.push(betObj);
+    }
+
+    res.json({ success: true, balance: currentBalance - betAmount, betId: betId });
 
   } catch (err) {
     console.error(err);
@@ -272,6 +281,10 @@ app.post('/cancel_bet', async (req, res) => {
     await pool.query("UPDATE bets SET status = 'cancelled' WHERE id = $1", [betId]);
     await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)", [formattedPhone, betAmount, 'cancel_bet', 'success']);
     
+    // Remove from in-memory arrays
+    if (typeof activeBets !== 'undefined') activeBets = activeBets.filter(b => b.id !== betId);
+    if (typeof pendingBets !== 'undefined') pendingBets = pendingBets.filter(b => b.id !== betId);
+
     const user = await pool.query('SELECT balance FROM users WHERE phone = $1', [formattedPhone]);
     res.json({ success: true, balance: parseFloat(user.rows[0].balance) });
   } catch (err) {
@@ -293,6 +306,13 @@ app.post('/cashout', async (req, res) => {
 
     // If betId is provided, update the specific bet, otherwise update the latest placed bet for safety
     if (betId) {
+      if (typeof activeBets !== 'undefined') {
+        const bIndex = activeBets.findIndex(b => b.id === betId);
+        if (bIndex >= 0) {
+           if (activeBets[bIndex].cashedOut) return res.status(400).json({ error: 'Bet already cashed out' });
+           activeBets[bIndex].cashedOut = true;
+        }
+      }
       const betCheck = await pool.query("SELECT * FROM bets WHERE id = $1 AND phone = $2 AND status = 'placed'", [betId, formattedPhone]);
       if (betCheck.rows.length === 0) return res.status(400).json({ error: 'Bet already cashed out or invalid' });
       
@@ -609,6 +629,8 @@ let gameStatus = 'WAITING';
 let currentMultiplier = 1.00;
 let currentCrashPoint = 1.00;
 let oddsHistory = [];
+let activeBets = [];
+let pendingBets = [];
 
 app.get('/api/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -692,10 +714,36 @@ async function runGameLoop() {
       // Exponential curve: e^(0.08 * t). This makes it start slow and grow faster.
       currentMultiplier = Math.max(1.00, Math.exp(0.08 * elapsedSec));
       
+      // Auto cashout check
+      activeBets.forEach(async (bet) => {
+         if (bet.autoCashout && currentMultiplier >= bet.autoCashout && !bet.cashedOut) {
+            bet.cashedOut = true;
+            const winAmount = bet.amount * bet.autoCashout;
+            try {
+               await pool.query("UPDATE bets SET multiplier = $1, status = 'cashed_out' WHERE id = $2", [bet.autoCashout, bet.id]);
+               await pool.query('UPDATE users SET balance = balance + $1 WHERE phone = $2', [winAmount, bet.phone]);
+               await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, 'win', 'success')", [bet.phone, winAmount]);
+            } catch(e) {}
+         }
+      });
+
       if (currentMultiplier >= currentCrashPoint) {
          clearInterval(gameInterval);
          currentMultiplier = currentCrashPoint;
          gameStatus = 'CRASHED';
+         
+         // Mark remaining active bets as lost
+         try {
+             const lostIds = activeBets.filter(b => !b.cashedOut).map(b => b.id);
+             if (lostIds.length > 0) {
+                 pool.query("UPDATE bets SET status = 'lost' WHERE id = ANY($1)", [lostIds]).catch(()=>{});
+             }
+         } catch(e) {}
+         
+         // Move pending to active for next round
+         activeBets = [...pendingBets];
+         pendingBets = [];
+
          oddsHistory.unshift(currentCrashPoint.toFixed(2));
          if(oddsHistory.length > 15) oddsHistory.pop();
          
