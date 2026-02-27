@@ -54,8 +54,10 @@ function formatPhone(phone) {
    AUTH ROUTES
 ========================= */
 
-app.get('/', (req, res) => {
-  res.send('Unified Server Running');
+app.use(express.static(path.join(__dirname, "public")));
+
+app.get('/ping', (req, res) => {
+  res.json({ status: 'ok' });
 });
 
 app.post('/signup', async (req, res) => {
@@ -942,3 +944,14 @@ app.get("/receipt/:reference/pdf", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Unified Server running on port ${PORT}`);
 });
+
+/* =========================
+   EXPORT FOR BRIDGE
+========================= */
+if (require.main !== module) {
+  module.exports = app;
+} else {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
