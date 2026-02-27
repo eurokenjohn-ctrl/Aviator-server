@@ -685,9 +685,12 @@ async function runGameLoop() {
    gameStatus = 'RUNNING';
    currentCrashPoint = await getNextCrashPoint();
    
+   let startTime = Date.now();
+   
    let gameInterval = setInterval(() => {
-      let increment = currentMultiplier < 2 ? 0.01 : currentMultiplier < 5 ? 0.05 : 0.1;
-      currentMultiplier += increment;
+      let elapsedSec = (Date.now() - startTime) / 1000;
+      // Exponential curve: e^(0.08 * t). This makes it start slow and grow faster.
+      currentMultiplier = Math.max(1.00, Math.exp(0.08 * elapsedSec));
       
       if (currentMultiplier >= currentCrashPoint) {
          clearInterval(gameInterval);
