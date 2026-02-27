@@ -75,10 +75,29 @@ app.post('/signup', async (req, res) => {
       return res.status(400).json({ error: 'Username or Phone number already in use' });
     }
 
+    let actualReferralCode = null;
+    if (referralCode) {
+      const checkRef = await pool.query('SELECT username FROM users WHERE username = $1', [referralCode]);
+      if (checkRef.rows.length === 0) {
+        return res.status(400).json({ error: 'Invalid referral code' });
+      }
+      actualReferralCode = referralCode;
+    }
+
     await pool.query(
       'INSERT INTO users (username, phone, pin, balance, referral_code) VALUES ($1, $2, $3, 0, $4)',
-      [username, formattedPhone, pin, referralCode || null]
+      [username, formattedPhone, pin, actualReferralCode]
     );
+
+    if (actualReferralCode) {
+      await pool.query('UPDATE users SET balance = balance + 20 WHERE username = $1', [actualReferralCode]);
+      const referrerUser = await pool.query('SELECT phone FROM users WHERE username = $1', [actualReferralCode]);
+      if (referrerUser.rows.length > 0) {
+        const referrerPhone = referrerUser.rows[0].phone;
+        await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, $3, $4)", [referrerPhone, 20, 'referral_bonus', 'success']);
+        await pool.query("INSERT INTO notifications (phone, message) VALUES ($1, $2)", [referrerPhone, `You received KSH 20 for referring ${username}.`]);
+      }
+    }
 
     res.json({ success: true, message: 'Signup successful' });
 
@@ -519,6 +538,69 @@ app.post('/api/notifications/mark-read', async (req, res) => {
 });
 
 /* =========================
+   REFERRAL SYSTEM
+========================= */
+
+app.get('/api/referrals', async (req, res) => {
+  const { phone } = req.query;
+  const formattedPhone = formatPhone(phone);
+  
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+
+  try {
+    const userResult = await pool.query('SELECT username, referral_code FROM users WHERE phone = $1', [formattedPhone]);
+    if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    
+    const user = userResult.rows[0];
+    
+    // Get people referred by this user
+    const referredUsersResult = await pool.query(
+      'SELECT username, created_at FROM users WHERE referral_code = $1 ORDER BY created_at DESC', 
+      [user.username]
+    );
+    
+    // Get earnings from referrals (both joining bonus and deposit commissions)
+    const earningsResult = await pool.query(
+      "SELECT SUM(amount) as total_earned FROM transactions WHERE phone = $1 AND type IN ('referral_bonus', 'referral_commission') AND status = 'success'",
+      [formattedPhone]
+    );
+    
+    // Get total deposits by referred users
+    let totalDeposits = 0;
+    if (referredUsersResult.rows.length > 0) {
+      const referredUsernames = referredUsersResult.rows.map(r => r.username);
+      // Get their phones to query transactions
+      const referredPhonesResult = await pool.query(
+        'SELECT phone FROM users WHERE username = ANY($1)',
+        [referredUsernames]
+      );
+      const referredPhones = referredPhonesResult.rows.map(r => r.phone);
+      
+      if (referredPhones.length > 0) {
+        const depositsResult = await pool.query(
+          "SELECT SUM(amount) as total FROM transactions WHERE phone = ANY($1) AND type = 'deposit' AND status = 'success'",
+          [referredPhones]
+        );
+        totalDeposits = parseFloat(depositsResult.rows[0].total || 0);
+      }
+    }
+    
+    res.json({
+      success: true,
+      referred_by: user.referral_code,
+      referral_link: `https://swiftcrash.com/?ref=${user.username}`,
+      referrals: referredUsersResult.rows,
+      active_referrals: referredUsersResult.rows.length,
+      total_deposits: totalDeposits,
+      total_earned: parseFloat(earningsResult.rows[0].total_earned || 0)
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================
    GAME ENGINE & SSE
 ========================= */
 
@@ -726,6 +808,23 @@ app.post("/callback", async (req, res) => {
         [receipts[ref].phone, receipts[ref].amount, 'deposit', ref, 'success']);
       await pool.query('INSERT INTO notifications (phone, message) VALUES ($1, $2)',
         [receipts[ref].phone, `Your deposit of KSH ${receipts[ref].amount} was successful.`]);
+
+      // Process Referral Commission (5%)
+      const userRes = await pool.query('SELECT username, referral_code FROM users WHERE phone = $1', [receipts[ref].phone]);
+      if (userRes.rows.length > 0 && userRes.rows[0].referral_code) {
+        const referrerUsername = userRes.rows[0].referral_code;
+        const commission = receipts[ref].amount * 0.05;
+        
+        await pool.query('UPDATE users SET balance = balance + $1 WHERE username = $2', [commission, referrerUsername]);
+        
+        const referrerRes = await pool.query('SELECT phone FROM users WHERE username = $1', [referrerUsername]);
+        if (referrerRes.rows.length > 0) {
+           const referrerPhone = referrerRes.rows[0].phone;
+           await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, 'referral_commission', 'success')", [referrerPhone, commission]);
+           await pool.query("INSERT INTO notifications (phone, message) VALUES ($1, $2)", [referrerPhone, `You received KSH ${commission.toFixed(2)} commission from ${userRes.rows[0].username}'s deposit.`]);
+        }
+      }
+
       console.log("✅ Balance updated in PostgreSQL");
     } catch (err) {
       console.error("❌ DB update failed:", err.message);
