@@ -217,6 +217,20 @@ app.post('/refresh-balance', async (req, res) => {
 /* =========================
    BETTING & CASH OUT
 ========================= */
+app.post('/api/my-bets', async (req, res) => {
+  const { phone } = req.body;
+  const formattedPhone = formatPhone(phone);
+  if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
+  try {
+    const bets = await pool.query(
+      "SELECT amount, multiplier, status, created_at FROM bets WHERE phone = $1 ORDER BY created_at DESC",
+      [formattedPhone]
+    );
+    res.json({ success: true, bets: bets.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error fetching bets' });
+  }
+});
 
 app.post('/bet', async (req, res) => {
   const { phone, amount, autoCashout } = req.body;
