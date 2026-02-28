@@ -111,12 +111,15 @@ app.post('/login', async (req, res) => {
    const formattedPhone = formatPhone(phone);
   try {
     const user = await pool.query(
-      'SELECT username, phone, balance FROM users WHERE phone = $1 AND pin = $2',
+      'SELECT username, phone, balance, status FROM users WHERE phone = $1 AND pin = $2',
       [formattedPhone, pin]
     );
 
     if (user.rows.length > 0) {
-      res.json({ success: true, user: user.rows[0] });
+      if (user.rows[0].status === 'suspended') {
+        return res.status(403).json({ error: 'Your account is suspended. Please contact support.' });
+      }
+      res.json({ success: true, user: { username: user.rows[0].username, phone: user.rows[0].phone, balance: user.rows[0].balance } });
     } else {
       res.status(401).json({ error: 'Invalid phone or PIN' });
     }
@@ -193,11 +196,14 @@ app.post('/refresh-balance', async (req, res) => {
   const formattedPhone = formatPhone(phone);
   try {
     const user = await pool.query(
-      'SELECT balance FROM users WHERE phone = $1',
+      'SELECT balance, status FROM users WHERE phone = $1',
       [formattedPhone]
     );
 
     if (user.rows.length > 0) {
+      if (user.rows[0].status === 'suspended') {
+        return res.status(403).json({ error: 'suspended' });
+      }
       res.json({ success: true, balance: user.rows[0].balance });
     } else {
       res.status(404).json({ error: 'User not found' });
@@ -403,6 +409,39 @@ app.post('/admin/set-odds', async (req, res) => {
   if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
   try {
     await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('next_multiplier', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [req.body.multiplier]);
+    res.json({success: true});
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.post('/admin/set-bounds', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  try {
+    const min = parseFloat(req.body.min);
+    const max = parseFloat(req.body.max);
+    if(!isNaN(min) && !isNaN(max)) {
+      await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('admin_min_odd', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [min]);
+      await pool.query("INSERT INTO settings (setting_key, setting_value) VALUES ('admin_max_odd', $1) ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value", [max]);
+      res.json({success: true});
+    } else {
+      await pool.query("DELETE FROM settings WHERE setting_key IN ('admin_min_odd', 'admin_max_odd')");
+      res.json({success: true});
+    }
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
+app.post('/admin/create-user', async (req, res) => {
+  const pwd = req.headers['authorization'];
+  if(pwd !== '3462Abel@#') return res.status(401).json({error: 'Unauthorized'});
+  try {
+    const { phone, username, pin, balance } = req.body;
+    const formattedPhone = formatPhone(phone);
+    if(!formattedPhone) return res.status(400).json({error: 'Invalid phone format'});
+    
+    await pool.query(
+      'INSERT INTO users (username, phone, pin, balance) VALUES ($1, $2, $3, $4)',
+      [username, formattedPhone, pin, parseFloat(balance) || 0]
+    );
     res.json({success: true});
   } catch(e) { res.status(500).json({error: e.message}); }
 });
@@ -655,6 +694,18 @@ async function getNextCrashPoint() {
      }
    } catch(e) {}
    
+   try {
+     const minQuery = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'admin_min_odd'");
+     const maxQuery = await pool.query("SELECT setting_value FROM settings WHERE setting_key = 'admin_max_odd'");
+     if(minQuery.rows.length > 0 && maxQuery.rows.length > 0) {
+        let minVal = parseFloat(minQuery.rows[0].setting_value);
+        let maxVal = parseFloat(maxQuery.rows[0].setting_value);
+        if(!isNaN(minVal) && !isNaN(maxVal) && maxVal >= minVal) {
+           return parseFloat((minVal + Math.random() * (maxVal - minVal)).toFixed(2));
+        }
+     }
+   } catch(e) {}
+
    const rand = Math.random();
    let cp;
    if (rand < 0.5) {
