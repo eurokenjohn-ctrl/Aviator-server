@@ -279,6 +279,10 @@ app.post('/cancel_bet', async (req, res) => {
   if (!formattedPhone) return res.status(400).json({ error: 'Invalid phone format' });
 
   try {
+    if (typeof activeBets !== 'undefined' && activeBets.find(b => b.id === betId)) {
+       return res.status(400).json({ error: 'Bet already locked for the round' });
+    }
+
     const betResult = await pool.query("SELECT * FROM bets WHERE id = $1 AND phone = $2 AND status = 'placed'", [betId, formattedPhone]);
     if (betResult.rows.length === 0) return res.status(400).json({ error: 'Bet not found or already processed' });
     
@@ -744,35 +748,38 @@ async function runGameLoop() {
    broadcast({ status: 'WAITING', time: 6, history: oddsHistory });
    
    let waitTime = 6;
-   let waitInt = setInterval(() => {
+   let waitInt = setInterval(async () => {
       waitTime--;
       broadcast({ status: 'WAITING', time: waitTime, history: oddsHistory });
+      
+      if (waitTime === 1) {
+         // Move pending to active and deduct balances for the new round
+         for (let i = 0; i < pendingBets.length; i++) {
+           let bet = pendingBets[i];
+           try {
+             const userRes = await pool.query('SELECT balance FROM users WHERE phone = $1', [bet.phone]);
+             if (userRes.rows.length > 0) {
+               let bal = parseFloat(userRes.rows[0].balance);
+               if (bal >= bet.amount) {
+                 await pool.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [bet.amount, bet.phone]);
+                 await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, 'bet', 'success')", [bet.phone, bet.amount]);
+                 activeBets.push(bet);
+               } else {
+                 await pool.query("UPDATE bets SET status = 'cancelled' WHERE id = $1", [bet.id]);
+               }
+             }
+           } catch (e) {
+             console.error("Error processing pending bet:", e);
+           }
+         }
+         pendingBets = [];
+      }
+      
       if(waitTime <= 0) clearInterval(waitInt);
    }, 1000);
    
    await new Promise(r => setTimeout(r, 6000));
    
-   // Move pending to active and deduct balances for the new round
-   for (let i = 0; i < pendingBets.length; i++) {
-     let bet = pendingBets[i];
-     try {
-       const userRes = await pool.query('SELECT balance FROM users WHERE phone = $1', [bet.phone]);
-       if (userRes.rows.length > 0) {
-         let bal = parseFloat(userRes.rows[0].balance);
-         if (bal >= bet.amount) {
-           await pool.query('UPDATE users SET balance = balance - $1 WHERE phone = $2', [bet.amount, bet.phone]);
-           await pool.query("INSERT INTO transactions (phone, amount, type, status) VALUES ($1, $2, 'bet', 'success')", [bet.phone, bet.amount]);
-           activeBets.push(bet);
-         } else {
-           await pool.query("UPDATE bets SET status = 'cancelled' WHERE id = $1", [bet.id]);
-         }
-       }
-     } catch (e) {
-       console.error("Error processing pending bet:", e);
-     }
-   }
-   pendingBets = [];
-
    gameStatus = 'RUNNING';
    currentCrashPoint = await getNextCrashPoint();
    
